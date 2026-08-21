@@ -62,7 +62,6 @@ jobs:
             target
             node_modules
             apps/readest-app/node_modules
-          # v3: 避免旧缓存导致 which 等模块缺失
           key: free-cloud-win-v3-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'apps/readest-app/src-tauri/Cargo.lock') }}
           restore-keys: |
             free-cloud-win-v3-${{ runner.os }}-
@@ -78,7 +77,6 @@ jobs:
       - name: Install JS dependencies
         run: |
           set -euo pipefail
-          # Windows + pnpm 严格隔离时 cross-spawn 会找不到 which
           echo "node-linker=hoisted" >> .npmrc
           pnpm install
           pnpm add -w which || pnpm add which || true
@@ -143,8 +141,10 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Android
-  # 错误原因：仓库里 gen/android 是空目录，没有 settings.gradle，
-  # 必须先 tauri android init 生成完整 Gradle 工程再 build。
+  # - gen/android 上游为空，必须 tauri android init
+  # - 不用 --debug，减小体积
+  # - 补 MANAGE_EXTERNAL_STORAGE，否则无法「管理所有文件」
+  # - release 用 debug 密钥签名，便于侧载
   # ---------------------------------------------------------------------------
   build-android:
     if: ${{ inputs.build_android }}
@@ -250,16 +250,30 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
 
-          # 上游仓库里 gen/android 是空目录，没有 Gradle 工程文件
           rm -rf src-tauri/gen/android
           pnpm exec tauri android init
 
-          # 确认 Gradle 根文件已生成
           test -f src-tauri/gen/android/settings.gradle \
             || test -f src-tauri/gen/android/settings.gradle.kts
           ls -la src-tauri/gen/android/
 
-          # 若存在 store flavor（foss/googleplay），默认选 foss，避免 variant 歧义
+          MANIFEST="src-tauri/gen/android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q 'xmlns:tools=' "$MANIFEST"; then
+              sed -i 's|xmlns:android="http://schemas.android.com/apk/res/android"|xmlns:android="http://schemas.android.com/apk/res/android"\n    xmlns:tools="http://schemas.android.com/tools"|' "$MANIFEST"
+            fi
+            if ! grep -q 'MANAGE_EXTERNAL_STORAGE' "$MANIFEST"; then
+              sed -i 's|<manifest\([^>]*\)>|<manifest\1>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />|' "$MANIFEST"
+            fi
+            if ! grep -q 'requestLegacyExternalStorage' "$MANIFEST"; then
+              sed -i 's|<application|<application android:requestLegacyExternalStorage="true"|' "$MANIFEST" || true
+            fi
+            echo "===== Manifest (permissions) ====="
+            grep -E 'uses-permission|requestLegacy|package=' "$MANIFEST" || true
+          else
+            echo "::warning::AndroidManifest.xml not found"
+          fi
+
           GRADLE_KTS="src-tauri/gen/android/app/build.gradle.kts"
           if [ -f "$GRADLE_KTS" ] && ! grep -q 'missingDimensionStrategy' "$GRADLE_KTS"; then
             if grep -q 'defaultConfig' "$GRADLE_KTS"; then
@@ -267,7 +281,13 @@ jobs:
             fi
           fi
 
-      - name: Build Android APK (debug-signed)
+          if [ -f "$GRADLE_KTS" ]; then
+            if ! grep -q 'signingConfig = signingConfigs.getByName("debug")' "$GRADLE_KTS"; then
+              sed -i '/release {/,/}/ s|isMinifyEnabled = false|isMinifyEnabled = false\n            signingConfig = signingConfigs.getByName("debug")|' "$GRADLE_KTS" || true
+            fi
+          fi
+
+      - name: Build Android APK (release, debug-signed)
         working-directory: ${{ env.APP_DIR }}
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
@@ -277,23 +297,25 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
 
-          # debug 签名便于侧载；aarch64 覆盖绝大多数手机
           if [ -f .env.tauri ]; then
-            pnpm exec dotenv -e .env.tauri -- tauri android build --debug --apk -t aarch64 \
-              || pnpm exec tauri android build --debug --apk -t aarch64
+            pnpm exec dotenv -e .env.tauri -- tauri android build --apk -t aarch64 \
+              || pnpm exec tauri android build --apk -t aarch64
           else
-            pnpm exec tauri android build --debug --apk -t aarch64
+            pnpm exec tauri android build --apk -t aarch64
           fi
 
           ROOT="${GITHUB_WORKSPACE}"
           mkdir -p "$ROOT/dist"
-          APK=$(find "$ROOT" -name '*.apk' -type f 2>/dev/null | head -1)
+          APK=$(find "$ROOT" -path '*release*' -name '*.apk' -type f 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find "$ROOT" -name '*.apk' -type f 2>/dev/null | head -1)
+          fi
           if [ -z "$APK" ] || [ ! -f "$APK" ]; then
             echo "::error::APK not found"
             find "$ROOT" -name '*.apk' 2>/dev/null | head -30 || true
-            find "$ROOT/apps/readest-app/src-tauri/gen/android" -type f -name '*.apk' 2>/dev/null | head -20 || true
             exit 1
           fi
+          echo "Using APK: $APK ($(du -h "$APK" | cut -f1))"
           cp "$APK" "$ROOT/dist/Readest-free-cloud-sync.apk"
           ls -la "$ROOT/dist/"
 
