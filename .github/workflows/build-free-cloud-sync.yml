@@ -1,0 +1,165 @@
+# .github/workflows/build-free-cloud-sync.yml
+#
+# 目标：关掉 CLOUD_SYNC_REQUIRES_PREMIUM，编译 Windows 便携版（未签名）
+# 不依赖官方 release 的签名 / Discord / 上传密钥等 Secrets
+#
+# 用法：Actions → Build free cloud-sync → Run workflow
+# 成功后在 Artifacts 下载 readest.exe
+
+name: Build free cloud-sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release 优化构建（更小更慢；默认 debug 更快）"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_DIR: apps/readest-app
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # 完整历史不是必须；若 submodule 有问题可改为 fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo & pnpm store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            node_modules
+            apps/readest-app/node_modules
+          key: free-cloud-win-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'apps/readest-app/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            free-cloud-win-${{ runner.os }}-
+
+      - name: Disable cloud-sync premium gate
+        run: |
+          set -euo pipefail
+          FILE="apps/readest-app/src/utils/access.ts"
+          if [ ! -f "$FILE" ]; then
+            echo "::error::File not found: $FILE"
+            exit 1
+          fi
+          # 无论仓库里是 true 还是 false，强制改为 false
+          sed -i 's/export const CLOUD_SYNC_REQUIRES_PREMIUM = true;/export const CLOUD_SYNC_REQUIRES_PREMIUM = false;/' "$FILE"
+          if grep -q 'CLOUD_SYNC_REQUIRES_PREMIUM = false' "$FILE"; then
+            echo "OK: CLOUD_SYNC_REQUIRES_PREMIUM = false"
+          else
+            echo "::error::Failed to set CLOUD_SYNC_REQUIRES_PREMIUM = false"
+            grep -n 'CLOUD_SYNC_REQUIRES_PREMIUM' "$FILE" || true
+            exit 1
+          fi
+
+      - name: Install JS dependencies
+        run: pnpm install
+
+      - name: Vendor wasm / pdfjs assets
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          for leaf in \
+            prepare-public-vendor \
+            copy-pdfjs-js copy-pdfjs-wasm copy-pdfjs-fonts \
+            copy-flatten-pdfjs-annotation-layer-css copy-flatten-pdfjs-text-layer-css \
+            copy-simplecc copy-jieba
+          do
+            if pnpm run "$leaf"; then
+              echo "OK: $leaf"
+            else
+              echo "::warning::Vendor step failed (may be optional on this version): $leaf"
+            fi
+          done
+
+      - name: Build frontend (Next.js)
+        working-directory: ${{ env.APP_DIR }}
+        run: pnpm build
+
+      - name: Build native Windows app (Tauri)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          # 避免 tauri 再嵌套跑一次 pnpm build（Windows 上容易出 PATH 问题）
+          printf '%s\n' '{"build":{"beforeBuildCommand":""}}' > .ci-tauri-override.json
+
+          if [ "${{ inputs.release }}" = "true" ]; then
+            FLAG=""
+            PROFILE="release"
+          else
+            FLAG="--debug"
+            PROFILE="debug"
+          fi
+
+          # 有 dotenv + .env.tauri 就用；没有就直接 tauri
+          if [ -f .env.tauri ] && pnpm exec dotenv --help >/dev/null 2>&1; then
+            pnpm exec dotenv -e .env.tauri -- tauri build $FLAG --no-bundle \
+              --config .ci-tauri-override.json
+          else
+            pnpm exec tauri build $FLAG --no-bundle \
+              --config .ci-tauri-override.json
+          fi
+
+          # 产物路径：仓库根 target/ 或 src-tauri 下，两种都找
+          ROOT="${GITHUB_WORKSPACE}"
+          EXE=""
+          for cand in \
+            "$ROOT/target/$PROFILE/readest.exe" \
+            "$ROOT/apps/readest-app/src-tauri/target/$PROFILE/readest.exe" \
+            "$ROOT/target/$PROFILE/readest.exe"
+          do
+            if [ -f "$cand" ]; then
+              EXE="$cand"
+              break
+            fi
+          done
+          if [ -z "$EXE" ]; then
+            EXE=$(find "$ROOT" -name 'readest.exe' -type f 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$EXE" ] || [ ! -f "$EXE" ]; then
+            echo "::error::readest.exe not found"
+            find "$ROOT/target" -name '*.exe' 2>/dev/null | head -50 || true
+            exit 1
+          fi
+
+          mkdir -p "$ROOT/dist"
+          cp "$EXE" "$ROOT/dist/readest.exe"
+          echo "Built: $ROOT/dist/readest.exe"
+          ls -la "$ROOT/dist/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: readest-free-cloud-sync-windows
+          path: dist/readest.exe
+          if-no-files-found: error
+          retention-days: 14
