@@ -14,10 +14,14 @@ on:
         description: "Windows: Release 优化构建（无控制台黑框）"
         type: boolean
         default: true
+      build_windows:
+        description: "编译 Windows exe"
+        type: boolean
+        default: true
       build_android:
         description: "同时编译 Android APK"
         type: boolean
-        default: true
+        default: false
       publish_release:
         description: "同时创建/更新 GitHub Release（便于手机与电脑直接下载）"
         type: boolean
@@ -32,6 +36,7 @@ jobs:
   # Windows
   # ---------------------------------------------------------------------------
   build-windows:
+    if: ${{ inputs.build_windows }}
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
@@ -62,6 +67,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
             apps/readest-app/src-tauri/target
           key: free-cloud-win-cargo-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'apps/readest-app/src-tauri/Cargo.lock') }}
           restore-keys: |
@@ -116,15 +122,29 @@ jobs:
           pnpm exec tauri build $FLAG --no-bundle --config .ci-tauri-override.json
 
           ROOT="${GITHUB_WORKSPACE}"
-          EXE=$(find "$ROOT/apps/readest-app/src-tauri/target" -name 'readest.exe' -type f 2>/dev/null | head -1)
+          EXE=""
+          for candidate in \
+            "$ROOT/target/release/readest.exe" \
+            "$ROOT/target/x86_64-pc-windows-msvc/release/readest.exe" \
+            "$ROOT/apps/readest-app/src-tauri/target/release/readest.exe"
+          do
+            if [ -f "$candidate" ]; then
+              EXE="$candidate"
+              break
+            fi
+          done
+
           if [ -z "$EXE" ] || [ ! -f "$EXE" ]; then
-            EXE=$(find "$ROOT/target" -name 'readest.exe' -type f 2>/dev/null | head -1)
+            EXE=$(find "$ROOT" -name 'readest.exe' -type f 2>/dev/null | head -1 || true)
           fi
+
           if [ -z "$EXE" ] || [ ! -f "$EXE" ]; then
             echo "::error::readest.exe not found"
             find "$ROOT" -name '*.exe' 2>/dev/null | head -50 || true
             exit 1
           fi
+
+          echo "Found readest.exe at: $EXE ($(du -h "$EXE" | cut -f1))"
           mkdir -p "$ROOT/dist"
           cp "$EXE" "$ROOT/dist/readest.exe"
           ls -la "$ROOT/dist/"
