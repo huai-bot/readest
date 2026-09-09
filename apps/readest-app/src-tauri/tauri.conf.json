@@ -66,7 +66,16 @@
     },
     "linux": {
       "deb": {
-        "section": "text"
+        "section": "text",
+        "depends": ["libwebkit2gtk-4.1-0"]
+      },
+      "rpm": {
+        "depends": ["libwebkit2gtk-4.1.so.0()(64bit)"]
+      },
+      "appimage": {
+        "files": {
+          "bin/00-no-userns-prompt.hook": "appimage/00-no-userns-prompt.hook"
+        }
       }
     },
     "android": {
@@ -75,7 +84,7 @@
     "iOS": {
       "developmentTeam": "J5W48D69VR",
       "infoPlist": "./Info-ios.plist",
-      "minimumSystemVersion": "15.0"
+      "minimumSystemVersion": "16.4"
     },
     "fileAssociations": [
       {
@@ -228,7 +237,7 @@
     },
     "webview-upgrade": {
       "minUpgradeMajor": 121,
-      "minSupportedMajor": 92
+      "minSupportedMajor": 111
     }
   }
 }
